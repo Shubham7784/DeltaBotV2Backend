@@ -1,0 +1,364 @@
+"""SQLAlchemy ORM models for Delta Bot V2 domain persistence."""
+
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.session import Base
+from app.db.enums import TradeLifecycleState
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class Instrument(Base):
+    """Trading instruments configured in Delta Bot (Futures & Options)."""
+    __tablename__ = "instruments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(50), unique=True, index=True, nullable=False)
+    product_id: Mapped[Optional[int]] = mapped_column(Integer, unique=True, index=True, nullable=True)
+    contract_type: Mapped[str] = mapped_column(String(50), default="perpetual_futures", nullable=False)
+    underlying_asset: Mapped[str] = mapped_column(String(20), default="BTC", nullable=False)
+    tick_size: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    contract_value: Mapped[float] = mapped_column(Float, default=0.001, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "product_id": self.product_id,
+            "contract_type": self.contract_type,
+            "underlying_asset": self.underlying_asset,
+            "tick_size": self.tick_size,
+            "contract_value": self.contract_value,
+            "is_active": self.is_active,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Candle(Base):
+    """Multi-timeframe candlestick store (5m, 15m, 1h)."""
+    __tablename__ = "candles"
+    __table_args__ = (
+        UniqueConstraint("symbol", "resolution", "open_time", name="uq_candle_symbol_res_time"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    resolution: Mapped[str] = mapped_column(String(10), index=True, nullable=False)  # 5m, 15m, 1h
+    open_time: Mapped[int] = mapped_column(Integer, index=True, nullable=False)  # Unix timestamp
+    open: Mapped[float] = mapped_column(Float, nullable=False)
+    high: Mapped[float] = mapped_column(Float, nullable=False)
+    low: Mapped[float] = mapped_column(Float, nullable=False)
+    close: Mapped[float] = mapped_column(Float, nullable=False)
+    volume: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    close_time: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    is_closed: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "resolution": self.resolution,
+            "open_time": self.open_time,
+            "open": self.open,
+            "high": self.high,
+            "low": self.low,
+            "close": self.close,
+            "volume": self.volume,
+            "close_time": self.close_time,
+            "is_closed": self.is_closed,
+        }
+
+
+class Strategy(Base):
+    """Trading strategy module configuration and state."""
+    __tablename__ = "strategies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(100), unique=True, index=True, nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    config: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "is_active": self.is_active,
+            "config": self.config,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Signal(Base):
+    """Raw candidate signal generated by a Strategy module."""
+    __tablename__ = "signals"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_name: Mapped[str] = mapped_column(String(100), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String(10), nullable=False)  # 5m, 15m, 1h
+    side: Mapped[str] = mapped_column(String(10), nullable=False)  # buy, sell
+    trigger_price: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence_score: Mapped[float] = mapped_column(Float, default=0.5, nullable=False)
+    indicator_snapshot: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    status: Mapped[str] = mapped_column(String(30), default="PENDING", index=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        snapshot = self.indicator_snapshot or {}
+        direction = "long" if self.side.lower() == "buy" else "short"
+        return {
+            "id": self.id,
+            "strategy_name": self.strategy_name,
+            "symbol": self.symbol,
+            "timeframe": self.timeframe,
+            "side": self.side,
+            "direction": snapshot.get("direction", direction),
+            "trigger_price": self.trigger_price,
+            "stop_loss": snapshot.get("stop_loss", self.trigger_price * (0.99 if self.side.lower() == "buy" else 1.01)),
+            "take_profit": snapshot.get("take_profit", self.trigger_price * (1.03 if self.side.lower() == "buy" else 0.97)),
+            "risk_reward_ratio": snapshot.get("risk_reward_ratio", 3.0),
+            "confidence_score": self.confidence_score,
+            "reasons": snapshot.get("reasons", []),
+            "indicator_snapshot": self.indicator_snapshot,
+            "status": self.status,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class TradeDecision(Base):
+    """Central trade tracking the formal 7-State Lifecycle:
+    SIGNAL_GENERATED -> VALIDATING -> LLM_CONFIRMED -> RISK_VALIDATED -> ORDER_SUBMITTED -> POSITION_OPEN -> EXITED
+    """
+    __tablename__ = "trade_decisions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    direction: Mapped[str] = mapped_column(String(10), nullable=False)  # long, short
+    state: Mapped[str] = mapped_column(
+        String(50), default=TradeLifecycleState.SIGNAL_GENERATED.value, index=True, nullable=False
+    )
+    subaccount: Mapped[str] = mapped_column(String(20), default="futures", nullable=False)
+    is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+
+    # Multi-timeframe synthesis context
+    timeframe_alignment: Mapped[Dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+    # LLM advisory validation stage
+    llm_approved: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    llm_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    llm_reasoning: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # Deterministic risk engine validation stage
+    risk_approved: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
+    risk_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    suggested_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    leverage: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    entry_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    take_profit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_loss_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    liquidation_buffer_pct: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+
+    # Exit & Performance metrics
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    exit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    opened_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    # Relationships
+    orders: Mapped[List["Order"]] = relationship(
+        "Order", back_populates="trade_decision", cascade="all, delete-orphan", lazy="selectin"
+    )
+    positions: Mapped[List["Position"]] = relationship(
+        "Position", back_populates="trade_decision", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "symbol": self.symbol,
+            "direction": self.direction,
+            "state": self.state,
+            "subaccount": self.subaccount,
+            "is_paper": self.is_paper,
+            "timeframe_alignment": self.timeframe_alignment,
+            "llm_approved": self.llm_approved,
+            "llm_confidence": self.llm_confidence,
+            "llm_reasoning": self.llm_reasoning,
+            "risk_approved": self.risk_approved,
+            "risk_notes": self.risk_notes,
+            "suggested_size": self.suggested_size,
+            "leverage": self.leverage,
+            "entry_price": self.entry_price,
+            "take_profit_price": self.take_profit_price,
+            "stop_loss_price": self.stop_loss_price,
+            "liquidation_buffer_pct": self.liquidation_buffer_pct,
+            "realized_pnl": self.realized_pnl,
+            "exit_price": self.exit_price,
+            "exit_reason": self.exit_reason,
+            "opened_at": self.opened_at.isoformat() if self.opened_at else None,
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Order(Base):
+    """Exchange or paper orders routed for a trade."""
+    __tablename__ = "orders"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_decision_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("trade_decisions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    subaccount: Mapped[str] = mapped_column(String(20), default="futures", nullable=False)
+    exchange_order_id: Mapped[Optional[str]] = mapped_column(String(100), index=True, nullable=True)
+    client_order_id: Mapped[Optional[str]] = mapped_column(String(100), index=True, nullable=True)
+    symbol: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    product_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)  # buy, sell
+    order_type: Mapped[str] = mapped_column(String(30), default="limit_order", nullable=False)
+    price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    unfilled_size: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    state: Mapped[str] = mapped_column(String(30), default="open", index=True, nullable=False)
+    is_paper: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    is_bracket: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    bracket_take_profit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    bracket_stop_loss_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    response_payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    trade_decision: Mapped[Optional["TradeDecision"]] = relationship("TradeDecision", back_populates="orders")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "trade_decision_id": self.trade_decision_id,
+            "subaccount": self.subaccount,
+            "exchange_order_id": self.exchange_order_id,
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "product_id": self.product_id,
+            "side": self.side,
+            "order_type": self.order_type,
+            "price": self.price,
+            "stop_price": self.stop_price,
+            "size": self.size,
+            "unfilled_size": self.unfilled_size,
+            "state": self.state,
+            "is_paper": self.is_paper,
+            "is_bracket": self.is_bracket,
+            "bracket_take_profit_price": self.bracket_take_profit_price,
+            "bracket_stop_loss_price": self.bracket_stop_loss_price,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class Position(Base):
+    """Open and closed position tracking."""
+    __tablename__ = "positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    trade_decision_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("trade_decisions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    subaccount: Mapped[str] = mapped_column(String(20), default="futures", nullable=False)
+    symbol: Mapped[str] = mapped_column(String(50), index=True, nullable=False)
+    product_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    entry_price: Mapped[float] = mapped_column(Float, nullable=False)
+    current_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    liquidation_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    margin: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    leverage: Mapped[int] = mapped_column(Integer, default=50, nullable=False)
+    unrealized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    realized_pnl: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    take_profit_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    stop_loss_price: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    is_open: Mapped[bool] = mapped_column(Boolean, default=True, index=True, nullable=False)
+    exit_reason: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+    trade_decision: Mapped[Optional["TradeDecision"]] = relationship("TradeDecision", back_populates="positions")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "trade_decision_id": self.trade_decision_id,
+            "subaccount": self.subaccount,
+            "symbol": self.symbol,
+            "product_id": self.product_id,
+            "size": self.size,
+            "entry_price": self.entry_price,
+            "current_price": self.current_price,
+            "liquidation_price": self.liquidation_price,
+            "margin": self.margin,
+            "leverage": self.leverage,
+            "unrealized_pnl": self.unrealized_pnl,
+            "realized_pnl": self.realized_pnl,
+            "take_profit_price": self.take_profit_price,
+            "stop_loss_price": self.stop_loss_price,
+            "is_open": self.is_open,
+            "exit_reason": self.exit_reason,
+            "opened_at": self.opened_at.isoformat() if self.opened_at else None,
+            "closed_at": self.closed_at.isoformat() if self.closed_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AuditLog(Base):
+    """System, risk, and trade audit trail for invariant checking."""
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String(50), default="SYSTEM", index=True, nullable=False)
+    severity: Mapped[str] = mapped_column(String(20), default="INFO", index=True, nullable=False)
+    message: Mapped[str] = mapped_column(Text, nullable=False)
+    subaccount: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    symbol: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    payload: Mapped[Optional[Dict[str, Any]]] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, index=True)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "event_type": self.event_type,
+            "severity": self.severity,
+            "message": self.message,
+            "subaccount": self.subaccount,
+            "symbol": self.symbol,
+            "payload": self.payload,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
