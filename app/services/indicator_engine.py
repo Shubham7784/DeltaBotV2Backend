@@ -668,12 +668,15 @@ class IndicatorEngine:
         if not buf or len(buf) < 2:
             return None
 
-        opens = buf.get_opens()
-        highs = buf.get_highs()
-        lows = buf.get_lows()
-        closes = buf.get_closes()
-        volumes = buf.get_volumes()
-        times = buf.get_timestamps()
+        closed_candles = [c for c in buf.get_all() if c.get("is_closed", True)]
+        if len(closed_candles) < 2:
+            return None
+        opens = [c["open"] for c in closed_candles]
+        highs = [c["high"] for c in closed_candles]
+        lows = [c["low"] for c in closed_candles]
+        closes = [c["close"] for c in closed_candles]
+        volumes = [c["volume"] for c in closed_candles]
+        times = [c["open_time"] for c in closed_candles]
 
         return self.calculate_from_series(
             symbol=symbol,

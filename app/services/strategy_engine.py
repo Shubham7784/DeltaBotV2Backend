@@ -985,7 +985,7 @@ class StrategyEngine:
         symbol = symbol.upper()
         # 1. Fetch live indicator snapshot & candles
         buf = market_engine.get_buffer(symbol, timeframe)
-        candles = [CandleItem(**c) for c in buf.get_all()] if buf else []
+        candles = [CandleItem(**c) for c in buf.get_all() if c.get("is_closed", True)] if buf else []
         snapshot = indicator_engine.get_snapshot(symbol=symbol, timeframe=timeframe)
         if not snapshot:
             if candles and len(candles) >= 2:

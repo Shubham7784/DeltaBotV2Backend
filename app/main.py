@@ -5,6 +5,7 @@ FastAPI backend for Delta Exchange API v2.
 
 from contextlib import asynccontextmanager
 import asyncio
+import time
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
@@ -13,18 +14,54 @@ from app.api.api_router import api_router
 from app.db.session import AsyncSessionLocal, init_db
 from app.services.market_data_engine import market_engine
 from app.services.strategy_engine import strategy_engine
+from app.services.execution_engine import execution_engine
 
 logger = setup_logging(debug=False)
 
 async def strategy_evaluation_loop() -> None:
-    """Continuously evaluate strategies after the market-data poller refreshes buffers."""
+    """Evaluate each symbol/timeframe once when its latest candle has closed."""
+    candle_seconds = {"5m": 300, "15m": 900, "1h": 3600}
+    last_evaluated: dict[tuple[str, str], int] = {}
     while True:
         try:
             await asyncio.sleep(25)
-            results = await strategy_engine.evaluate_all(persist=True)
-            signal_count = sum(len(signals) for signals in results.values())
-            if signal_count:
-                logger.info("Strategy cycle generated %d candidate signal(s)", signal_count)
+            now = int(time.time())
+            signal_count = 0
+            candle_closed = False
+            for symbol in market_engine.tracked_symbols:
+                for timeframe, duration in candle_seconds.items():
+                    buffer = market_engine.get_buffer(symbol, timeframe)
+                    if not buffer:
+                        continue
+                    closed = next(
+                        (candle for candle in reversed(buffer.get_all())
+                         if int(candle["open_time"]) + duration <= now),
+                        None,
+                    )
+                    if not closed:
+                        continue
+                    key = (symbol, timeframe)
+                    candle_open = int(closed["open_time"])
+                    if candle_open <= last_evaluated.get(key, 0):
+                        continue
+                    last_evaluated[key] = candle_open
+                    candle_closed = True
+                    signals = await strategy_engine.evaluate_symbol(
+                        symbol=symbol, timeframe=timeframe, persist=True
+                    )
+                    signal_count += len(signals)
+
+            resumed_count = (
+                await execution_engine.resume_pending_signal_trades()
+                if candle_closed
+                else 0
+            )
+            if signal_count or resumed_count:
+                logger.info(
+                    "Strategy cycle generated %d candidate signal(s) and resumed %d pending trade(s)",
+                    signal_count,
+                    resumed_count,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:

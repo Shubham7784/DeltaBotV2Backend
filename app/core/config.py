@@ -82,6 +82,8 @@ class Settings(BaseSettings):
 
     # Order Defaults
     DEFAULT_LEVERAGE: int = Field(default=50, description="Default leverage for futures contracts")
+    BTC_ETH_FUTURES_LEVERAGE: int = Field(default=100, ge=1, description="Leverage for BTCUSD and ETHUSD futures")
+    OPTIONS_LEVERAGE: int = Field(default=50, ge=1, description="Leverage for options account trades")
     DEFAULT_TP_PCT: float = Field(default=4.0, description="Default Take Profit percentage")
     DEFAULT_SL_PCT: float = Field(default=1.0, description="Default Stop Loss percentage")
 
@@ -113,6 +115,8 @@ class Settings(BaseSettings):
             "initial_wallet_inr": self.INITIAL_WALLET_INR,
             "initial_wallet_usd": self.INITIAL_WALLET_USD,
             "default_leverage": self.DEFAULT_LEVERAGE,
+            "btc_eth_futures_leverage": self.BTC_ETH_FUTURES_LEVERAGE,
+            "options_leverage": self.OPTIONS_LEVERAGE,
             "default_tp_pct": self.DEFAULT_TP_PCT,
             "default_sl_pct": self.DEFAULT_SL_PCT,
             "initial_instruments": self.INITIAL_INSTRUMENTS,

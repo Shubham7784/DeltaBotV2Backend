@@ -3,10 +3,11 @@
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.leverage import get_trade_leverage
 from app.db.enums import (
     AuditEventType,
     AuditSeverity,
@@ -342,6 +343,23 @@ class TradeRepository:
         leverage: int = 50,
         suggested_size: Optional[int] = None,
     ) -> TradeDecision:
+        terminal_states = [
+            TradeLifecycleState.EXITED.value,
+            "REJECTED_LLM",
+            "REJECTED_RISK",
+            "CANCELLED",
+        ]
+        active_count = await session.scalar(
+            select(func.count(TradeDecision.id)).where(
+                TradeDecision.symbol == symbol.upper(),
+                TradeDecision.state.not_in(terminal_states),
+            )
+        )
+        if (active_count or 0) >= 2:
+            raise ValueError(
+                f"Cannot create trade for {symbol.upper()}: the limit of 2 active trades per asset has been reached."
+            )
+
         decision = TradeDecision(
             symbol=symbol.upper(),
             direction=direction.lower(),
@@ -352,7 +370,7 @@ class TradeRepository:
             entry_price=entry_price,
             take_profit_price=take_profit_price,
             stop_loss_price=stop_loss_price,
-            leverage=leverage,
+            leverage=get_trade_leverage(symbol, subaccount, leverage),
             suggested_size=suggested_size,
         )
         decision.orders = []

@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.leverage import get_trade_leverage
 from app.db.enums import (
     AuditEventType,
     AuditSeverity,
@@ -64,6 +65,56 @@ class ExecutionOrchestrator:
         self._monitoring_task: Optional[asyncio.Task] = None
         self._is_monitoring: bool = False
 
+    async def resume_pending_signal_trades(self) -> int:
+        """Retry auto-generated signal trades that stopped before position confirmation.
+
+        The state machine persists each transition before contacting the next external
+        dependency. A transient failure can therefore leave an automatically generated
+        trade in an active state; this scan resumes only trades linked to a signal.
+        """
+        resumable_states = (
+            TradeLifecycleState.SIGNAL_GENERATED.value,
+            TradeLifecycleState.VALIDATING.value,
+            TradeLifecycleState.LLM_CONFIRMED.value,
+            TradeLifecycleState.RISK_VALIDATED.value,
+            TradeLifecycleState.ORDER_SUBMITTED.value,
+        )
+        pending: List[tuple[int, str]] = []
+        async with get_db_session() as session:
+            active = await TradeRepository.get_trade_decisions(
+                session=session, active_only=True, limit=1000
+            )
+
+        terminal_states = {"REJECTED_LLM", "REJECTED_RISK", "CANCELLED", TradeLifecycleState.EXITED.value}
+        active_by_symbol: Dict[str, List[TradeDecision]] = {}
+        for trade in active:
+            if trade.state not in terminal_states:
+                active_by_symbol.setdefault(trade.symbol, []).append(trade)
+
+        # Recover only the two newest active decisions per asset. Older queued
+        # decisions may predate the per-asset cap and must not flood the exchange.
+        for trades in active_by_symbol.values():
+            selected = sorted(trades, key=lambda trade: trade.id, reverse=True)[:2]
+            pending.extend(
+                (trade.id, trade.state)
+                for trade in selected
+                if trade.state in resumable_states
+                and (trade.timeframe_alignment or {}).get("signal_id") is not None
+            )
+
+        resumed = 0
+        for trade_id, state in pending:
+            try:
+                await self.advance_trade_lifecycle(
+                    trade_id=trade_id,
+                    auto_execute=True,
+                    notes=f"Resuming auto-generated signal trade from {state}",
+                )
+                resumed += 1
+            except Exception:
+                logger.exception("Could not resume auto-generated trade #%s from %s", trade_id, state)
+        return resumed
+
     async def advance_trade_lifecycle(
         self,
         trade_id: int,
@@ -88,6 +139,19 @@ class ExecutionOrchestrator:
                     message=f"Trade #{trade_id} is in terminal state '{curr_state}'",
                     is_terminal=True,
                 )
+
+            if curr_state in {
+                TradeLifecycleState.SIGNAL_GENERATED.value,
+                TradeLifecycleState.VALIDATING.value,
+                TradeLifecycleState.LLM_CONFIRMED.value,
+                TradeLifecycleState.RISK_VALIDATED.value,
+            }:
+                configured_leverage = get_trade_leverage(
+                    trade.symbol, trade.subaccount, trade.leverage
+                )
+                if trade.leverage != configured_leverage:
+                    trade.leverage = configured_leverage
+                    await session.commit()
 
         # ---------------------------------------------------------------------
         # STATE 1: SIGNAL_GENERATED -> STATE 2: VALIDATING
@@ -255,13 +319,36 @@ class ExecutionOrchestrator:
                     order_res = await _invoke_client(client.get_order_by_client_oid, client_order_id)
                     known_order = order_res.get("result") if isinstance(order_res, dict) else None
                 except Exception as lookup_error:
-                    if getattr(lookup_error, "status_code", None) != 404:
+                    is_not_found = (
+                        getattr(lookup_error, "status_code", None) == 404
+                        or getattr(lookup_error, "code", None) in {"order_not_found", "not_found"}
+                    )
+                    if not is_not_found:
                         raise RuntimeError(
                             f"Could not verify prior submission for {client_order_id}; refusing duplicate order"
                         ) from lookup_error
                     known_order = None
 
                 if not isinstance(known_order, dict) or not known_order:
+                    if not trade.is_paper:
+                        product_response = await _invoke_client(
+                            client.get_product_by_symbol, trade.symbol
+                        )
+                        product = product_response.get("result", {}) if isinstance(product_response, dict) else {}
+                        product_id = product.get("id") if isinstance(product, dict) else None
+                        if product_id is None:
+                            raise RuntimeError(
+                                f"Could not resolve product ID for {trade.symbol}; leverage was not applied"
+                            )
+                        leverage_response = await _invoke_client(
+                            client.set_order_leverage,
+                            product_id=int(product_id),
+                            leverage=trade.leverage,
+                        )
+                        if isinstance(leverage_response, dict) and leverage_response.get("success") is False:
+                            raise RuntimeError(
+                                f"Exchange rejected {trade.leverage}x leverage for {trade.symbol}: {leverage_response}"
+                            )
                     order_res = await _invoke_client(
                         client.place_order,
                         symbol=trade.symbol,

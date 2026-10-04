@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.leverage import get_trade_leverage
 from app.db.enums import TradeLifecycleState
 from app.db.models import TradeDecision
 from app.db.repository import TradeRepository
@@ -189,6 +190,7 @@ class DeterministicRiskEngine:
         total_equity: float,
         leverage: int,
         symbol: str,
+        margin_budget: Optional[float] = None,
     ) -> Tuple[int, float, float, float, float]:
         """Calculates integer contract size where potential loss <= 1% capital.
 
@@ -219,6 +221,13 @@ class DeterministicRiskEngine:
             else:
                 calculated_size = 0
 
+        # Leverage changes the margin-backed lot ceiling, while the stop-loss
+        # risk limit remains the primary cap on the position size.
+        if margin_budget is not None and entry_price > 0 and leverage > 0:
+            margin_per_contract = entry_price * contract_unit / leverage
+            margin_lot_limit = int(math.floor(max(0.0, margin_budget) / margin_per_contract))
+            calculated_size = min(calculated_size, margin_lot_limit)
+
         actual_dollar_risk = calculated_size * loss_per_contract
         dollar_risk_pct = (actual_dollar_risk / total_equity) * 100.0 if total_equity > 0 else 0.0
 
@@ -248,6 +257,7 @@ class DeterministicRiskEngine:
         """Executes full deterministic risk evaluation against all system invariants."""
         symbol = symbol.upper()
         direction = direction.lower()
+        leverage = get_trade_leverage(symbol, subaccount, leverage)
         rejections: List[str] = []
         warnings: List[str] = []
 
@@ -289,6 +299,14 @@ class DeterministicRiskEngine:
             total_equity=capital.total_equity,
             leverage=leverage,
             symbol=symbol,
+            margin_budget=max(
+                0.0,
+                min(
+                    capital.available_margin,
+                    capital.usable_trading_capital - capital.blocked_margin,
+                    capital.total_equity * (self.max_exposure_pct / 100.0) - capital.blocked_margin,
+                ),
+            ),
         )
 
         if calc_size <= 0:

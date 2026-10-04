@@ -12,6 +12,7 @@ CRITICAL ARCHITECTURAL CONSTRAINTS:
 """
 
 import logging
+import asyncio
 import os
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
@@ -45,6 +46,20 @@ class LLMAdvisoryService:
 
     def __init__(self):
         self.api_key = os.getenv("GEMINI_API_KEY")
+        self._evaluation_cache: Dict[tuple, LLMAdvisoryEvaluation] = {}
+        self._cache_lock = asyncio.Lock()
+
+    def _regime_cache_key(self, symbol: str, direction: str) -> tuple:
+        """Key advisory reuse to the completed market candles used by regime analysis."""
+        candle_times = []
+        for timeframe in ("1h", "15m", "5m"):
+            buffer = market_engine.get_buffer(symbol, timeframe)
+            latest = next(
+                (candle for candle in reversed(buffer.get_all()) if candle.get("is_closed", True)),
+                None,
+            ) if buffer else None
+            candle_times.append(latest["open_time"] if latest else None)
+        return symbol.upper(), direction.lower(), tuple(candle_times)
 
     def _deterministic_regime_eval(
         self,
@@ -135,6 +150,37 @@ class LLMAdvisoryService:
         )
 
     async def evaluate_trade(
+        self,
+        symbol: str,
+        direction: str,
+        entry_price: float,
+        stop_loss_price: float,
+        take_profit_price: float,
+        primary_timeframe: str = "5m",
+    ) -> LLMAdvisoryEvaluation:
+        """Reuse one advisory decision per symbol, direction, and candle set."""
+        cache_key = self._regime_cache_key(symbol, direction)
+        async with self._cache_lock:
+            cached = self._evaluation_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        result = await self._evaluate_trade_uncached(
+            symbol=symbol,
+            direction=direction,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            take_profit_price=take_profit_price,
+            primary_timeframe=primary_timeframe,
+        )
+        async with self._cache_lock:
+            self._evaluation_cache[cache_key] = result
+            if len(self._evaluation_cache) > 1000:
+                self._evaluation_cache.clear()
+                self._evaluation_cache[cache_key] = result
+        return result
+
+    async def _evaluate_trade_uncached(
         self,
         symbol: str,
         direction: str,

@@ -165,6 +165,7 @@ class MarketDataEngine:
 
     DEFAULT_SYMBOLS = ["BTCUSD", "ETHUSD", "SOLUSD"]
     DEFAULT_TIMEFRAMES = ["5m", "15m", "1h"]
+    TIMEFRAME_SECONDS = {"5m": 300, "15m": 900, "1h": 3600}
 
     def __init__(self):
         self._buffers: Dict[str, Dict[str, CandleRingBuffer]] = {}
@@ -173,6 +174,7 @@ class MarketDataEngine:
         self._is_running = False
         self._last_sync_time: Optional[datetime] = None
         self._poll_interval_sec: int = 20
+        self._last_candle_sync_bucket: Dict[tuple[str, str], int] = {}
         self._lock = asyncio.Lock()
 
         # Initialize empty buffers for default symbols & timeframes
@@ -294,6 +296,7 @@ class MarketDataEngine:
                 close_p = float(item.get("close", 0.0))
                 volume = float(item.get("volume", 0.0))
                 close_t = item.get("close_time")
+                is_closed = open_t + self.TIMEFRAME_SECONDS[resolution] <= now
 
                 # Upsert into database
                 await TradeRepository.save_candle(
@@ -307,7 +310,7 @@ class MarketDataEngine:
                     close_p=close_p,
                     volume=volume,
                     close_time=int(close_t) if close_t else None,
-                    is_closed=True,
+                    is_closed=is_closed,
                 )
 
                 # Upsert into in-memory ring buffer
@@ -319,7 +322,7 @@ class MarketDataEngine:
                     close_p=close_p,
                     volume=volume,
                     close_time=int(close_t) if close_t else None,
-                    is_closed=True,
+                    is_closed=is_closed,
                 )
                 normalized_items.append(c_item)
 
@@ -424,15 +427,23 @@ class MarketDataEngine:
                 await self.update_live_prices()
 
                 # 2. Synchronize the most recent candle window (last 2 hours)
+                now = int(time.time())
                 async with AsyncSessionLocal() as session:
                     for sym in list(self._buffers.keys()):
                         for tf in self.DEFAULT_TIMEFRAMES:
-                            await self.sync_symbol_timeframe(
+                            duration = self.TIMEFRAME_SECONDS[tf]
+                            bucket = now // duration
+                            sync_key = (sym, tf)
+                            if self._last_candle_sync_bucket.get(sync_key) == bucket:
+                                continue
+                            sync_result = await self.sync_symbol_timeframe(
                                 session=session,
                                 symbol=sym,
                                 resolution=tf,
                                 lookback_hours=2,
                             )
+                            if sync_result.status == "ok":
+                                self._last_candle_sync_bucket[sync_key] = bucket
 
             except asyncio.CancelledError:
                 logger.info("Market Data Engine background poller cancelled")

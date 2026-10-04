@@ -35,6 +35,7 @@ async def get_system_status() -> SystemStatusResponse:
             "active": True,
             "credentials_configured": futures_ready,
             "default_leverage": settings.DEFAULT_LEVERAGE,
+            "btc_eth_leverage": settings.BTC_ETH_FUTURES_LEVERAGE,
             "default_tp_pct": settings.DEFAULT_TP_PCT,
             "default_sl_pct": settings.DEFAULT_SL_PCT,
         },
@@ -43,6 +44,7 @@ async def get_system_status() -> SystemStatusResponse:
             "active": True,
             "credentials_configured": options_ready,
             "subaccount_isolated": True,
+            "leverage": settings.OPTIONS_LEVERAGE,
             "status": "Ready for Phase 11 Options Engine specification",
         },
     }
